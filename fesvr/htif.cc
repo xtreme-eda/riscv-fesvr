@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <signal.h>
+#include <getopt.h>
 
 /* Attempt to determine the execution prefix automatically.  autoconf
  * sets PREFIX, and pconfigure sets __PCONFIGURE__PREFIX. */
@@ -38,7 +39,7 @@ static void handle_signal(int sig)
   signal(sig, &handle_signal);
 }
 
-htif_t::htif_t(const std::vector<std::string>& args)
+htif_t::htif_t()
   : mem(this), entry(DRAM_BASE), sig_addr(0), sig_len(0),
     tohost_addr(0), fromhost_addr(0), exitcode(0), stopped(false),
     syscall_proxy(this)
@@ -46,33 +47,25 @@ htif_t::htif_t(const std::vector<std::string>& args)
   signal(SIGINT, &handle_signal);
   signal(SIGTERM, &handle_signal);
   signal(SIGABRT, &handle_signal); // we still want to call static destructors
+}
 
-  size_t i;
-  for (i = 0; i < args.size(); i++)
-    if (args[i].length() && args[i][0] != '-' && args[i][0] != '+')
-      break;
+htif_t::htif_t(int argc, char** argv) : htif_t()
+{
+  parse_arguments(argc, argv);
+  register_devices();
+}
 
-  hargs.insert(hargs.begin(), args.begin(), args.begin() + i);
-  targs.insert(targs.begin(), args.begin() + i, args.end());
-
-  for (auto& arg : hargs)
-  {
-    if (arg == "+rfb")
-      dynamic_devices.push_back(new rfb_t);
-    else if (arg.find("+rfb=") == 0)
-      dynamic_devices.push_back(new rfb_t(atoi(arg.c_str() + strlen("+rfb="))));
-    else if (arg.find("+disk=") == 0)
-      dynamic_devices.push_back(new disk_t(arg.c_str() + strlen("+disk=")));
-    else if (arg.find("+signature=") == 0)
-      sig_file = arg.c_str() + strlen("+signature=");
-    else if (arg.find("+chroot=") == 0)
-      syscall_proxy.set_chroot(arg.substr(strlen("+chroot=")).c_str());
+htif_t::htif_t(const std::vector<std::string>& args) : htif_t()
+{
+  int argc = args.size() + 1;
+  char * argv[argc];
+  argv[0] = (char *) "htif";
+  for (unsigned int i = 0; i < args.size(); i++) {
+    argv[i+1] = (char *) args[i].c_str();
   }
 
-  device_list.register_device(&syscall_proxy);
-  device_list.register_device(&bcd);
-  for (auto d : dynamic_devices)
-    device_list.register_device(d);
+  parse_arguments(argc, argv);
+  register_devices();
 }
 
 htif_t::~htif_t()
@@ -102,9 +95,27 @@ void htif_t::load_program()
   }
 
   if (path.empty())
-    throw std::runtime_error("could not open " + targs[0]);
+    throw std::runtime_error(
+        "could not open " + targs[0] +
+        " (did you misspell it? If VCS, did you forget +permissive/+permissive-off?)");
 
-  std::map<std::string, uint64_t> symbols = load_elf(path.c_str(), &mem, &entry);
+  // temporarily construct a memory interface that skips writing bytes
+  // that have already been preloaded through a sideband
+  class preload_aware_memif_t : public memif_t {
+   public:
+    preload_aware_memif_t(htif_t* htif) : memif_t(htif), htif(htif) {}
+
+    void write(addr_t taddr, size_t len, const void* src) override
+    {
+      if (!htif->is_address_preloaded(taddr, len))
+        memif_t::write(taddr, len, src);
+    }
+
+   private:
+    htif_t* htif;
+  } preload_aware_memif(this);
+
+  std::map<std::string, uint64_t> symbols = load_elf(path.c_str(), &preload_aware_memif, &entry);
 
   if (symbols.count("tohost") && symbols.count("fromhost")) {
     tohost_addr = symbols["tohost"];
@@ -174,7 +185,7 @@ int htif_t::run()
   {
     if (auto tohost = mem.read_uint64(tohost_addr)) {
       mem.write_uint64(tohost_addr, 0);
-      command_t cmd(this, tohost, fromhost_callback);
+      command_t cmd(mem, tohost, fromhost_callback);
       device_list.handle_command(cmd);
     } else {
       idle();
@@ -201,4 +212,118 @@ bool htif_t::done()
 int htif_t::exit_code()
 {
   return exitcode >> 1;
+}
+
+void htif_t::parse_arguments(int argc, char ** argv)
+{
+  optind = 0; // reset optind as HTIF may run getopt _after_ others
+  while (1) {
+    static struct option long_options[] = { HTIF_LONG_OPTIONS };
+    int option_index = 0;
+    int c = getopt_long(argc, argv, "-h", long_options, &option_index);
+
+    if (c == -1) break;
+ retry:
+    switch (c) {
+      case 'h': usage(argv[0]);
+        throw std::invalid_argument("User quered htif_t help text");
+      case HTIF_LONG_OPTIONS_OPTIND:
+        if (optarg) dynamic_devices.push_back(new rfb_t(atoi(optarg)));
+        else        dynamic_devices.push_back(new rfb_t);
+        break;
+      case HTIF_LONG_OPTIONS_OPTIND + 1:
+        // [TODO] Remove once disks are supported again
+        throw std::invalid_argument("--disk/+disk unsupported (use a ramdisk)");
+        dynamic_devices.push_back(new disk_t(optarg));
+        break;
+      case HTIF_LONG_OPTIONS_OPTIND + 2:
+        sig_file = optarg;
+        break;
+      case HTIF_LONG_OPTIONS_OPTIND + 3:
+        syscall_proxy.set_chroot(optarg);
+        break;
+      case '?':
+        if (!opterr)
+          break;
+        throw std::invalid_argument("Unknown argument (did you mean to enable +permissive parsing?)");
+      case 1: {
+        std::string arg = optarg;
+        if (arg == "+rfb") {
+          c = HTIF_LONG_OPTIONS_OPTIND;
+          optarg = nullptr;
+        }
+        else if (arg.find("+rfb=") == 0) {
+          c = HTIF_LONG_OPTIONS_OPTIND;
+          optarg = optarg + 5;
+        }
+        else if (arg.find("+disk=") == 0) {
+          c = HTIF_LONG_OPTIONS_OPTIND + 1;
+          optarg = optarg + 6;
+        }
+        else if (arg.find("+signature=") == 0) {
+          c = HTIF_LONG_OPTIONS_OPTIND + 2;
+          optarg = optarg + 11;
+        }
+        else if (arg.find("+chroot=") == 0) {
+          c = HTIF_LONG_OPTIONS_OPTIND + 3;
+          optarg = optarg + 8;
+        }
+        else if (arg.find("+permissive-off") == 0) {
+          if (opterr)
+            throw std::invalid_argument("Found +permissive-off when not parsing permissively");
+          opterr = 1;
+          break;
+        }
+        else if (arg.find("+permissive") == 0) {
+          if (!opterr)
+            throw std::invalid_argument("Found +permissive when already parsing permissively");
+          opterr = 0;
+          break;
+        }
+        else {
+          if (!opterr)
+            break;
+          else {
+            optind--;
+            goto done_processing;
+          }
+        }
+        goto retry;
+      }
+    }
+  }
+
+done_processing:
+  while (optind < argc)
+    targs.push_back(argv[optind++]);
+  if (!targs.size()) {
+    usage(argv[0]);
+    throw std::invalid_argument("No binary specified (Did you forget it? Did you forget '+permissive-off' if running with +permissive?)");
+  }
+}
+
+void htif_t::register_devices()
+{
+  device_list.register_device(&syscall_proxy);
+  device_list.register_device(&bcd);
+  for (auto d : dynamic_devices)
+    device_list.register_device(d);
+}
+
+void htif_t::usage(const char * program_name)
+{
+  printf("Usage: %s [EMULATOR OPTION]... [VERILOG PLUSARG]... [HOST OPTION]... BINARY [TARGET OPTION]...\n ",
+         program_name);
+  fputs("\
+Run a BINARY on the Rocket Chip emulator.\n\
+\n\
+Mandatory arguments to long options are mandatory for short options too.\n\
+\n\
+EMULATOR OPTIONS\n\
+  Consult emulator.cc if using Verilator or VCS documentation if using VCS\n\
+    for available options.\n\
+EMUALTOR VERILOG PLUSARGS\n\
+  Consult generated-src*/*.plusArgs for available options\n\
+", stdout);
+  fputs("\n" HTIF_USAGE_OPTIONS, stdout);
 }
