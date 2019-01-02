@@ -16,13 +16,11 @@ int main(int argc, char** argv)
   unsigned long long int base = 0;
   if(argc==5) {
     base = atoll(argv[4]);
-    // Ian Perryman Mon Dec 31 14:18:24 EST 2018
-    // Rmeove check for power of 2 for XtremeEDA internal project
-    // if((base & (base-1)))
-    // {
-    //   std::cerr << "base must be a power of 2" << std::endl;
-    //   return 1;
-    // }
+    if((base % 8))
+    {
+      std::cerr << "base must be on a 8 byte (64 bit) boundary" << std::endl;
+      return 1;
+    }
   }
 
   unsigned width = atoi(argv[1]);
